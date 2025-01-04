@@ -49,7 +49,7 @@ class ELK_block(nn.Module):
         
         return x
     
-class ConvMambaLayer(nn.Module):
+class BiConvMambaLayer(nn.Module):
     def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, ELK=True):
         super().__init__()
         self.dim = dim
@@ -152,6 +152,32 @@ class ConvMambaLayer(nn.Module):
 
         return out 
     
+class MambaLayer(nn.Module):
+    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, num_slices=None):
+        super().__init__()
+        self.dim = dim
+        self.norm = nn.LayerNorm(dim)
+        self.mamba = Mamba(
+                d_model=dim, # Model dimension d_model
+                d_state=d_state,  # SSM state expansion factor
+                d_conv=d_conv,    # Local convolution width
+                expand=expand,    # Block expansion factor
+                bimamba_type='v2',
+                nslices=num_slices,
+        )
+    
+    def forward(self, x):
+        B, C = x.shape[:2]
+        assert C == self.dim
+        n_tokens = x.shape[2:].numel()
+        img_dims = x.shape[2:]
+        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
+        x_norm = self.norm(x_flat)
+        x_mamba = self.mamba(x_norm)
+
+        out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
+        return out   
+    
 class MambaResBlock(nn.Module):
     """
     VoxRes module
@@ -162,7 +188,7 @@ class MambaResBlock(nn.Module):
         self.block = nn.Sequential(
             nn.InstanceNorm3d(channel),
             nn.LeakyReLU(alpha),
-            *[ConvMambaLayer(channel) for j in range(depth)]
+            *[MambaLayer(channel) for j in range(depth)]
         )
         self.actout = nn.Sequential(
             nn.InstanceNorm3d(channel),
