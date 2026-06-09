@@ -5,6 +5,11 @@ import torch.nn.functional as nnf
 class SpatialTransformer(nn.Module):
     """
     N-D Spatial Transformer
+
+    NOTE: This version is used internally by the HCMReg model. It does NOT call
+    .cuda() on the grid buffer so that the module can be moved between devices
+    cleanly. A duplicate of this class also exists in utils.py (with .cuda())
+    for external use in training/inference scripts.
     """
 
     def __init__(self, size, mode="bilinear"):

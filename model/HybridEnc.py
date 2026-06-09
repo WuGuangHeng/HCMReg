@@ -178,9 +178,101 @@ class MambaLayer(nn.Module):
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
         return out   
     
+class ConvMambaLayerv2(nn.Module):
+    """
+    Mamba + Conv hybrid layer with attention fusion.
+    Byte-for-byte compatible with MambaFuse's ConvMambaLayerv2 (ELK path).
+    Splits channels: half through Mamba SSM, half through ELK conv_path,
+    then fuses with channel shuffle + attention gating.
+    """
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, ELK=True):
+        super().__init__()
+        self.dim = dim
+        self.div_dim = dim // 2
+        self.norm = nn.LayerNorm(self.div_dim)
+        self.mamba = Mamba(
+            d_model=self.div_dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            bimamba_type='v2',
+        )
+        if ELK:
+            self.conv_path = nn.Sequential(
+                nn.Conv3d(in_channels=self.div_dim, out_channels=self.div_dim, kernel_size=1, stride=1, padding=0),
+                nn.InstanceNorm3d(self.div_dim),
+                nn.LeakyReLU(0.1),
+                ELK_block(self.div_dim),
+                nn.InstanceNorm3d(self.div_dim),
+                nn.LeakyReLU(0.1),
+                nn.Conv3d(in_channels=self.div_dim, out_channels=self.div_dim, kernel_size=1, stride=1, padding=0),
+                nn.InstanceNorm3d(self.div_dim),
+                nn.LeakyReLU(0.1),
+            )
+        else:
+            self.conv_path = nn.Sequential(
+                nn.Conv3d(in_channels=self.div_dim, out_channels=self.div_dim, kernel_size=3, stride=1, padding=1),
+                nn.InstanceNorm3d(self.div_dim),
+                nn.LeakyReLU(0.1),
+                nn.Conv3d(in_channels=self.div_dim, out_channels=self.div_dim, kernel_size=3, stride=1, padding=1),
+                nn.InstanceNorm3d(self.div_dim),
+                nn.LeakyReLU(0.1),
+                nn.Conv3d(in_channels=self.div_dim, out_channels=self.div_dim, kernel_size=1, stride=1, padding=0),
+                nn.InstanceNorm3d(self.div_dim),
+                nn.LeakyReLU(0.1),
+            )
+
+        # Feature Fusion
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.conv_atten = nn.Sequential(
+            nn.Conv3d(dim, dim, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+        self.conv1 = nn.Conv3d(dim, dim, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv3d(dim, 1, kernel_size=1, stride=1, bias=True)
+        self.nonlin = nn.Sigmoid()
+
+    def channel_shuffle(self, x, groups: int):
+        batch_size, num_channels, depth, height, width = x.size()
+        channels_per_group = num_channels // groups
+        x = x.view(batch_size, groups, channels_per_group, depth, height, width)
+        x = torch.transpose(x, 1, 2).contiguous()
+        x = x.view(batch_size, -1, depth, height, width)
+        return x
+
+    def forward(self, x):
+        x_conv, x_mamba = x.chunk(2, dim=1)
+        B, C = x.shape[:2]
+        assert C == self.dim
+        n_tokens = x.shape[2:].numel()
+        img_dims = x.shape[2:]
+        x_mamba = x_mamba.reshape(B, C // 2, n_tokens).transpose(-1, -2)
+        x_mamba = self.norm(x_mamba)
+        x_mamba = self.mamba(x_mamba)
+        x_mamba = x_mamba.transpose(-1, -2).reshape(B, C // 2, *img_dims)
+
+        # conv path
+        x_conv = self.conv_path(x_conv)
+
+        x = torch.cat([x_conv, x_mamba], dim=1)
+        fused = self.channel_shuffle(x, 2)
+
+        attn = self.conv_atten(self.avg_pool(fused))
+        attn = self.nonlin(attn)
+        fused = fused * attn
+        fused = self.conv1(fused)
+
+        attn = self.conv2(x)
+        attn = self.nonlin(attn)
+        out = fused * attn
+
+        return out
+
+
 class MambaResBlock(nn.Module):
     """
-    VoxRes module
+    VoxRes module with ConvMambaLayerv2 (Mamba + Conv hybrid with attention fusion).
+    Byte-for-byte compatible with MambaFusev6's MambaResBlock.
     """
 
     def __init__(self, channel, depth=1, alpha=0.1):
@@ -188,7 +280,7 @@ class MambaResBlock(nn.Module):
         self.block = nn.Sequential(
             nn.InstanceNorm3d(channel),
             nn.LeakyReLU(alpha),
-            *[MambaLayer(channel) for j in range(depth)]
+            *[ConvMambaLayerv2(channel) for j in range(depth)]
         )
         self.actout = nn.Sequential(
             nn.InstanceNorm3d(channel),

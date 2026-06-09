@@ -176,7 +176,7 @@ class BrainDatasetA2S(Dataset):
         y_seg = np.ascontiguousarray(y_seg).astype(np.int16)
         x, y = torch.from_numpy(x), torch.from_numpy(y)
         x_seg, y_seg = torch.from_numpy(x_seg), torch.from_numpy(y_seg)
-        return x, y 
+        return x, y, x_seg, y_seg
 
     def __len__(self):
 

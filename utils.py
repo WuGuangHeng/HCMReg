@@ -33,6 +33,11 @@ class AverageMeter(object):
 class SpatialTransformer(nn.Module):
     """
     N-D Spatial Transformer
+
+    NOTE: This version is used externally in training/inference scripts. It
+    calls .cuda() on the grid buffer. A duplicate exists in model/func.py
+    (without .cuda()) for internal use by the HCMReg model, where the grid
+    is registered as a buffer and should not be hardcoded to CUDA.
     """
 
     def __init__(self, size, mode='bilinear'):
@@ -282,3 +287,101 @@ def jacobian_determinant_vxm(disp):
         dfdy = J[1]
 
         return dfdx[..., 0] * dfdy[..., 1] - dfdy[..., 0] * dfdx[..., 1]
+
+
+# ---------------------------------------------------------------------------
+# Weight management utilities
+# ---------------------------------------------------------------------------
+
+def load_pretrained_weights(model, checkpoint_path, device='cuda'):
+    """
+    Load pretrained weights into an HCMReg model.
+
+    Handles both:
+    - HCMReg-native checkpoints (converted via convert_weights.py)
+    - MambaFusev6 checkpoints (loaded with strict=False)
+
+    Args:
+        model: HCMReg model instance
+        checkpoint_path: path to .pth.tar checkpoint
+        device: target device ('cuda' or 'cpu')
+
+    Returns:
+        dict with keys: missing_keys, unexpected_keys, best_dsc, dataset
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt.get('state_dict', ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    info = {
+        'missing_keys': missing,
+        'unexpected_keys': unexpected,
+        'best_dsc': ckpt.get('best_dsc', None),
+        'dataset': ckpt.get('dataset', 'unknown'),
+        'source': ckpt.get('source', checkpoint_path),
+        'arch': ckpt.get('arch', 'unknown'),
+    }
+    return info
+
+
+def get_best_checkpoint(dataset, experiment_dir='experiments'):
+    """
+    Find the best checkpoint (highest DSC) for a given dataset.
+
+    Args:
+        dataset: dataset name (e.g., 'LPBA40')
+        experiment_dir: path to experiments directory
+
+    Returns:
+        str: path to best checkpoint, or None if not found
+    """
+    import glob
+    from natsort import natsorted
+
+    # Look for HCMReg experiment directories
+    pattern = os.path.join(experiment_dir, f'{dataset}-HCMReg*')
+    matches = natsorted(glob.glob(pattern))
+
+    if not matches:
+        return None
+
+    exp_dir = matches[-1]  # Most recent experiment
+    checkpoints = natsorted(glob.glob(os.path.join(exp_dir, 'dsc*.pth.tar')))
+
+    if not checkpoints:
+        return None
+
+    return checkpoints[-1]  # Highest DSC
+
+
+def list_checkpoints(dataset, experiment_dir='experiments'):
+    """
+    List all available checkpoints for a dataset with their DSC scores.
+
+    Args:
+        dataset: dataset name
+        experiment_dir: path to experiments directory
+
+    Returns:
+        list of (dsc_value, path) tuples, sorted by DSC
+    """
+    import glob
+    from natsort import natsorted
+
+    pattern = os.path.join(experiment_dir, f'{dataset}-HCMReg*')
+    matches = natsorted(glob.glob(pattern))
+
+    results = []
+    for exp_dir in matches:
+        ckpts = natsorted(glob.glob(os.path.join(exp_dir, 'dsc*.pth.tar')))
+        for ckpt in ckpts:
+            basename = os.path.basename(ckpt)
+            # Extract DSC from filename like 'dsc0.732.pth.tar'
+            try:
+                dsc_str = basename.replace('dsc', '').replace('.pth.tar', '')
+                dsc = float(dsc_str)
+            except ValueError:
+                dsc = 0.0
+            results.append((dsc, ckpt))
+
+    return sorted(results, key=lambda x: x[0], reverse=True)
